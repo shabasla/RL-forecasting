@@ -319,4 +319,300 @@ class TradingEnvironment:
             self.delayed_exit = False
             return self._get_next_state_or_episode_end(self.pending_reward)
 
-        if not
+        if not self.position_open:
+            # Episode is done, return terminal state
+            return np.zeros((self.lookback_window, len(self.state_cols))), 0, True, {
+                'trades_completed': self.trades_completed,
+                'episode_trades': self.episode_trades,
+                'reason': 'all_trades_completed'
+            }
+        
+        # Action is a decimal value from action_values (e.g., 0.02 for 2%)
+        action_value = action
+        
+        # Advance time by 1 day FIRST
+        self.current_step += 1
+        
+        next_data_idx = self.entry_data_idx + self.current_step
+        
+        # Check if we have more data
+        if next_data_idx >= len(self.data):
+            # No more data, close position at current price
+            current_price = self.data.iloc[self.current_data_idx]['close']
+            ret = (current_price - self.entry_price) / self.entry_price
+            reward = self._calculate_reward(ret, tp_sl_hit=False)
+            self._close_trade(ret, 'no_more_data')
+            return self._get_next_state_or_episode_end(reward)
+        
+        self.current_data_idx = next_data_idx
+        current_price = self.data.iloc[self.current_data_idx]['close']
+        
+        # Calculate current return
+        ret = (current_price - self.entry_price) / self.entry_price
+        
+        # Check if TP or SL hit BEFORE adjusting them
+        trade_done = False
+        tp_sl_hit = False
+        reason = 'continuing'
+        
+        if ret >= self.tp:
+            self.delayed_exit = True
+            self.pending_return = ret
+            self.pending_reason = 'tp_hit'
+            self.pending_reward = self._calculate_reward(ret, tp_sl_hit=True)
+            print(f"    TP hit (delayed exit)! Return: {ret:.4f}, TP: {self.tp:.4f}")
+            return self._get_state(), 0, False, {
+                'return': ret,
+                'tp': self.tp,
+                'sl': self.sl,
+                'step': self.current_step,
+                'delayed_exit': True
+            }
+
+        elif ret <= self.sl:
+            self.delayed_exit = True
+            self.pending_return = ret
+            self.pending_reason = 'sl_hit'
+            self.pending_reward = self._calculate_reward(ret, tp_sl_hit=True)
+            print(f"    SL hit (delayed exit)! Return: {ret:.4f}, SL: {self.sl:.4f}")
+            return self._get_state(), 0, False, {
+                'return': ret,
+                'tp': self.tp,
+                'sl': self.sl,
+                'step': self.current_step,
+                'delayed_exit': True
+            }
+
+        elif self.current_step >= self.max_steps:
+            trade_done = True
+            reason = 'max_steps'
+            print(f"    Max steps reached! Return: {ret:.4f}")
+            
+        # Calculate reward
+        reward = self._calculate_reward(ret, tp_sl_hit)
+        
+        if trade_done:
+            self._close_trade(ret, reason)
+            return self._get_next_state_or_episode_end(reward)
+        else:
+            # ONLY if trade continues, THEN adjust TP and SL asymmetrically
+            # Both TP and SL move by the same absolute amount (asymmetric window)
+            center_displacement = action_value
+            self.tp = center_displacement + 0.03
+            self.sl = center_displacement - 0.03
+            
+            # Continue current trade
+            next_state = self._get_state()
+            return next_state, reward, False, {
+                'return': ret, 
+                'reason': reason, 
+                'tp': self.tp, 
+                'sl': self.sl,
+                'trade_num': self.trades_completed + 1,
+                'step': self.current_step
+            }
+            
+    def _close_trade(self, final_return, reason):
+        """Close current trade and record results"""
+        trade_info = {   
+            'entry_date': self.entry_date,
+            'entry_price': self.entry_price,
+            'final_return': final_return,
+            'steps': self.current_step,
+            'reason': reason
+        }
+        self.episode_trades.append(trade_info)
+        self.trades_completed += 1
+        
+        print(f"    Trade {self.trades_completed} completed: Return {final_return:.4f}, Steps {self.current_step}, Reason: {reason}")
+        
+        # Move to next entry point
+        self.current_entry_idx += 1
+        self._start_new_trade()
+        
+    def _get_next_state_or_episode_end(self, reward):
+        """Get next state or signal episode end"""
+        episode_done = not self.position_open  # Episode done when no more positions
+        
+        if episode_done:
+            # Calculate episode statistics
+            total_return = sum(trade['final_return'] for trade in self.episode_trades)
+            avg_return = total_return / len(self.episode_trades) if self.episode_trades else 0
+            
+            next_state = np.zeros((self.lookback_window, len(self.state_cols)))
+            return next_state, reward, True, {
+                'trades_completed': self.trades_completed,
+                'total_return': total_return,
+                'avg_return': avg_return,
+                'episode_trades': self.episode_trades,
+                'reason': 'all_trades_completed'
+            }
+        else:
+            # Continue with next trade
+            next_state = self._get_state()
+            return next_state, reward, False, {
+                'trade_num': self.trades_completed,
+                'trades_completed': self.trades_completed,
+                'continuing_to_next_trade': True
+            }
+            
+    def _calculate_reward(self, ret, tp_sl_hit):
+        """
+        Reward function: shaped by exp(return/10) - 1,
+        and adds +ret only when TP or SL is hit.
+        """
+        time_reward = ((15 - self.current_step)/15)*0.5
+        shaped = (np.exp(ret) - 1)*0.1 + time_reward
+        bonus = ret if tp_sl_hit else 0
+        return shaped + bonus
+
+
+# Training Loop
+def train_sac(data_file, entry_points_file, episodes=1000, batch_size=64):
+    """
+    Train the SAC agent on trading data.
+    
+    Args:
+        data_file (str): Path to market data CSV file
+        entry_points_file (str): Path to entry signals CSV file
+        episodes (int): Number of training episodes
+        batch_size (int): Batch size for training updates
+    """
+    env = TradingEnvironment(data_file, entry_points_file)
+    state_dim = len(env.state_cols)
+    action_dim = 15  # Discrete actions: [-7%, -6%, ..., 0%, ..., +6%, +7%]
+    
+    agent = SACAgent(state_dim, action_dim)
+    replay_buffer = PrioritizedReplayBuffer(capacity=100000)
+    
+    episode_rewards = []
+    episode_total_returns = []
+    
+    for episode in range(episodes):
+        state = env.reset()
+        episode_reward = 0
+        done = False
+        step_count = 0
+        
+        # Linearly anneal beta from 0.4 to 1.0
+        beta = 0.4 + (1.0 - 0.4) * episode / episodes
+        
+        while not done:
+            # Select action
+            action, action_idx = agent.select_action(state)
+            
+            # Take step
+            next_state, reward, done, info = env.step(action)
+            
+            # Store transition
+            replay_buffer.push(state, action_idx, reward, next_state, done)
+            
+            # Update agent
+            if len(replay_buffer) > batch_size: 
+                agent.update(replay_buffer, batch_size, beta)
+                
+            state = next_state
+            episode_reward += reward
+            step_count += 1
+            
+            # Print step info if not episode end
+            if not done and 'trade_num' in info:
+                print(f"    Step {info.get('step', 0)}: Action {action:.3f}, Reward {reward:.4f}, Return {info.get('return', 0):.4f}, TP {info.get('tp', 0):.3f}, SL {info.get('sl', 0):.3f}")
+            
+        episode_rewards.append(episode_reward)
+        
+        # Episode summary
+        total_return = info.get('total_return', 0)
+        avg_return = info.get('avg_return', 0)
+        trades_completed = info.get('trades_completed', 0)
+        
+        episode_total_returns.append(total_return)
+        
+        print(f"\nEpisode {episode + 1}/{episodes} Summary:")
+        print(f"  Total Reward: {episode_reward:.4f}")
+        print(f"  Trades Completed: {trades_completed}")
+        print(f"  Total Return: {total_return:.4f}")
+        print(f"  Average Return per Trade: {avg_return:.4f}")
+        print(f"  Total Steps: {step_count}")
+        
+        # Print running averages
+        if episode >= 4:
+            avg_reward = np.mean(episode_rewards[-5:])
+            avg_total_return = np.mean(episode_total_returns[-5:])
+            print(f"  Last 5 episodes - Avg Reward: {avg_reward:.4f}, Avg Total Return: {avg_total_return:.4f}")
+        
+        print("=" * 100)
+        
+        # Save weights periodically
+        if (episode + 1) % 100 == 0:
+            os.makedirs('models', exist_ok=True)
+            torch.save(agent.actor.state_dict(), f'models/actor_weights_ep{episode + 1}.pth')
+            torch.save(agent.critic_1.state_dict(), f'models/critic1_weights_ep{episode + 1}.pth')
+            torch.save(agent.critic_2.state_dict(), f'models/critic2_weights_ep{episode + 1}.pth')
+            print(f"Saved model weights at episode {episode + 1}")
+    
+    # Save final weights after training completion
+    os.makedirs('models', exist_ok=True)
+    torch.save(agent.actor.state_dict(), f'models/final_actor_weights.pth')
+    torch.save(agent.critic_1.state_dict(), f'models/final_critic1_weights.pth')
+    torch.save(agent.critic_2.state_dict(), f'models/final_critic2_weights.pth')
+    torch.save(agent.target_critic_1.state_dict(), f'models/final_target_critic1_weights.pth')
+    torch.save(agent.target_critic_2.state_dict(), f'models/final_target_critic2_weights.pth')
+    
+    # Save complete model state (including optimizers and hyperparameters)
+    torch.save({
+        'episode': episodes,
+        'actor_state_dict': agent.actor.state_dict(),
+        'critic_1_state_dict': agent.critic_1.state_dict(),
+        'critic_2_state_dict': agent.critic_2.state_dict(),
+        'target_critic_1_state_dict': agent.target_critic_1.state_dict(),
+        'target_critic_2_state_dict': agent.target_critic_2.state_dict(),
+        'actor_optimizer_state_dict': agent.actor_optimizer.state_dict(),
+        'critic_optimizer_state_dict': agent.critic_optimizer.state_dict(),
+        'alpha_optimizer_state_dict': agent.alpha_optimizer.state_dict(),
+        'log_alpha': agent.log_alpha,
+        'episode_rewards': episode_rewards,
+        'episode_total_returns': episode_total_returns,
+    }, 'models/complete_model_checkpoint.pth')
+    
+    print(f"\nTraining completed! Final weights saved:")
+    print(f"  - models/final_actor_weights.pth")
+    print(f"  - models/final_critic1_weights.pth") 
+    print(f"  - models/final_critic2_weights.pth")
+    print(f"  - models/final_target_critic1_weights.pth")
+    print(f"  - models/final_target_critic2_weights.pth")
+    print(f"  - models/complete_model_checkpoint.pth (full checkpoint)")
+
+    return episode_rewards, episode_total_returns
+
+
+def main():
+    """Main function with command line arguments."""
+    parser = argparse.ArgumentParser(description='Train SAC Trading Agent')
+    parser.add_argument('--data', type=str, required=True, 
+                       help='Path to market data CSV file')
+    parser.add_argument('--signals', type=str, required=True,
+                       help='Path to entry signals CSV file')
+    parser.add_argument('--episodes', type=int, default=1000,
+                       help='Number of training episodes (default: 1000)')
+    parser.add_argument('--batch_size', type=int, default=64,
+                       help='Batch size for training (default: 64)')
+    
+    args = parser.parse_args()
+    
+    print("Starting SAC Trading Agent Training...")
+    print(f"Data file: {args.data}")
+    print(f"Signals file: {args.signals}")
+    print(f"Episodes: {args.episodes}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+    print("=" * 100)
+    
+    train_sac(args.data, args.signals, args.episodes, args.batch_size)
+
+
+if __name__ == "__main__":
+    # Example usage (uncomment and modify paths as needed):
+    # train_sac("data/market_data.csv", "data/entry_signals.csv", episodes=100)
+    
+    main()
